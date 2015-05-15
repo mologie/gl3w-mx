@@ -1,7 +1,30 @@
 #!/usr/bin/env python
 
-#   This file is part of gl3w, hosted at https://github.com/skaslev/gl3w
+#   gl3w-mx
+#   https://github.com/mologie/gl3w-mx
+#   Oliver Kuckertz, <oliver.kuckertz@mologie.de>, 2015
 #
+#   This is a fork of the gl3w tool. The original is available at:
+#   https://github.com/skaslev/gl3w
+#
+#   This fork extends GL3W by a per-context function pointer list, as
+#   required by WGL for using multiple drivers in a single application.
+#
+#   The available API mirrors GLEW's MX mode.
+#
+#   Usage:
+#   1. For each GL context you create, allocate one GL3WContext
+#   2. After creating the GL context, call gl3wInit(&yourGl3wContext),
+#      and check for a zero return value.
+#   3. Create a thread-local variable returning a pointer to a GL3WContext
+#      for the current GL context.
+#   4. Whenever your thread's GL context changes, update the variable to
+#      point to the correct GL3WContext structure.
+#   5. Tell GL3W-mx how to retrieve the current context, using for example:
+#      #define GL3W_CONTEXT_METHOD myActiveContext()
+#      ...where myActiveContext returns the contents of your thread-local
+#      variable.
+
 #   This is free and unencumbered software released into the public domain.
 #
 #   Anyone is free to copy, modify, publish, use, compile, sell, or
@@ -115,25 +138,35 @@ with open('include/GL/gl3w.h', 'wb') as f:
 #define __gl_h_
 #endif
 
+#include <string.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+typedef struct _GL3WContext {
+    int major;
+    int minor;
+''')
+    for proc in procs:
+        f.write('    {0[p_t]: <52} {0[p_s]};\n'.format(proc_t(proc)).encode("utf-8"))
+    f.write(br'''
+} GL3WContext;
+
+''')
+
+    for proc in procs:
+        f.write('#define {0[p]: <45} ((GL3W_CONTEXT_METHOD)->{0[p_s]})\n'.format(proc_t(proc)).encode("utf-8"))
+    f.write(br'''
+
 typedef void (*GL3WglProc)(void);
 
 /* gl3w api */
-int gl3wInit(void);
-int gl3wIsSupported(int major, int minor);
+int gl3wInit(GL3WContext *context);
+void gl3wShutdown(GL3WContext *context);
+int gl3wIsSupported(const GL3WContext *context, int major, int minor);
 GL3WglProc gl3wGetProcAddress(const char *proc);
 
-/* OpenGL functions */
-''')
-    for proc in procs:
-        f.write('extern {0[p_t]: <52} {0[p_s]};\n'.format(proc_t(proc)).encode("utf-8"))
-    f.write(b'\n')
-    for proc in procs:
-        f.write('#define {0[p]: <45} {0[p_s]}\n'.format(proc_t(proc)).encode("utf-8"))
-    f.write(br'''
 #ifdef __cplusplus
 }
 #endif
@@ -148,137 +181,133 @@ with open('src/gl3w.c', 'wb') as f:
     f.write(br'''#include <GL/gl3w.h>
 
 #ifdef _WIN32
+
 #define WIN32_LEAN_AND_MEAN 1
 #include <windows.h>
 
 static HMODULE libgl;
 
-static void open_libgl(void)
-{
-	libgl = LoadLibraryA("opengl32.dll");
+static void libgl_open(void) {
+    libgl = LoadLibraryA("opengl32.dll");
 }
 
-static void close_libgl(void)
-{
-	FreeLibrary(libgl);
+static void libgl_close(void) {
+    FreeLibrary(libgl);
 }
 
-static GL3WglProc get_proc(const char *proc)
-{
-	GL3WglProc res;
+static GL3WglProc libgl_sym(const char *proc) {
+    GL3WglProc res;
 
-	res = (GL3WglProc) wglGetProcAddress(proc);
-	if (!res)
-		res = (GL3WglProc) GetProcAddress(libgl, proc);
-	return res;
+    res = (GL3WglProc)wglGetProcAddress(proc);
+    if (!res)
+        res = (GL3WglProc)GetProcAddress(libgl, proc);
+    return res;
 }
+
 #elif defined(__APPLE__) || defined(__APPLE_CC__)
+
 #include <Carbon/Carbon.h>
 
-CFBundleRef bundle;
-CFURLRef bundleURL;
+static CFBundleRef bundle;
+static CFURLRef bundleURL;
 
-static void open_libgl(void)
-{
-	bundleURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault,
-		CFSTR("/System/Library/Frameworks/OpenGL.framework"),
-		kCFURLPOSIXPathStyle, true);
+static void libgl_open(void) {
+    bundleURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault,
+        CFSTR("/System/Library/Frameworks/OpenGL.framework"),
+        kCFURLPOSIXPathStyle, true);
 
-	bundle = CFBundleCreate(kCFAllocatorDefault, bundleURL);
-	assert(bundle != NULL);
+    bundle = CFBundleCreate(kCFAllocatorDefault, bundleURL);
+    assert(bundle != NULL);
 }
 
-static void close_libgl(void)
-{
-	CFRelease(bundle);
-	CFRelease(bundleURL);
+static void libgl_close(void) {
+    CFRelease(bundle);
+    CFRelease(bundleURL);
 }
 
-static GL3WglProc get_proc(const char *proc)
-{
-	GL3WglProc res;
+static GL3WglProc libgl_sym(const char *proc) {
+    GL3WglProc res;
 
-	CFStringRef procname = CFStringCreateWithCString(kCFAllocatorDefault, proc,
-		kCFStringEncodingASCII);
-	res = (GL3WglProc) CFBundleGetFunctionPointerForName(bundle, procname);
-	CFRelease(procname);
-	return res;
+    CFStringRef procName = CFStringCreateWithCString(kCFAllocatorDefault, proc,
+        kCFStringEncodingASCII);
+    res = (GL3WglProc)CFBundleGetFunctionPointerForName(bundle, procName);
+    CFRelease(procName);
+    return res;
 }
+
 #else
+
 #include <dlfcn.h>
 #include <GL/glx.h>
 
 static void *libgl;
 
-static void open_libgl(void)
-{
-	libgl = dlopen("libGL.so.1", RTLD_LAZY | RTLD_GLOBAL);
+static void libgl_open(void) {
+    libgl = dlopen("libGL.so.1", RTLD_LAZY | RTLD_GLOBAL);
 }
 
-static void close_libgl(void)
-{
-	dlclose(libgl);
+static void libgl_close(void) {
+    dlclose(libgl);
 }
 
-static GL3WglProc get_proc(const char *proc)
-{
-	GL3WglProc res;
+static GL3WglProc libgl_sym(const char *proc) {
+    GL3WglProc res;
 
-	res = (GL3WglProc) glXGetProcAddress((const GLubyte *) proc);
-	if (!res)
-		res = (GL3WglProc) dlsym(libgl, proc);
-	return res;
+    res = (GL3WglProc)glXGetProcAddress((const GLubyte *)proc);
+    if (!res)
+        res = (GL3WglProc)dlsym(libgl, proc);
+    return res;
 }
+
 #endif
 
-static struct {
-	int major, minor;
-} version;
-
-static int parse_version(void)
-{
-	if (!glGetIntegerv)
-		return -1;
-
-	glGetIntegerv(GL_MAJOR_VERSION, &version.major);
-	glGetIntegerv(GL_MINOR_VERSION, &version.minor);
-
-	if (version.major < 3)
-		return -1;
-	return 0;
-}
-
-static void load_procs(void);
-
-int gl3wInit(void)
-{
-	open_libgl();
-	load_procs();
-	close_libgl();
-	return parse_version();
-}
-
-int gl3wIsSupported(int major, int minor)
-{
-	if (major < 3)
-		return 0;
-	if (version.major == major)
-		return version.minor >= minor;
-	return version.major >= major;
-}
-
-GL3WglProc gl3wGetProcAddress(const char *proc)
-{
-	return get_proc(proc);
-}
-
 ''')
-    for proc in procs:
-        f.write('{0[p_t]: <52} {0[p_s]};\n'.format(proc_t(proc)).encode("utf-8"))
+
     f.write(br'''
-static void load_procs(void)
-{
+static int setup_context(GL3WContext *p) {
 ''')
+
     for proc in procs:
-        f.write('\t{0[p_s]} = ({0[p_t]}) get_proc("{0[p]}");\n'.format(proc_t(proc)).encode("utf-8"))
-    f.write(b'}\n')
+        f.write('    p->{0[p_s]} = ({0[p_t]})libgl_sym("{0[p]}");\n'.format(proc_t(proc)).encode("utf-8"))
+
+    f.write(br'''
+
+    if (!p->gl3wGetIntegerv)
+        return 0;
+
+    p->gl3wGetIntegerv(GL_MAJOR_VERSION, &p->major);
+    p->gl3wGetIntegerv(GL_MINOR_VERSION, &p->minor);
+
+    if (p->major < 3)
+        return 0;
+
+    return 1;
+}
+
+int gl3wInit(GL3WContext *context) {
+    int res;
+    libgl_open();
+    memset(context, 0, sizeof(*context));
+    res = setup_context(context);
+    return res;
+}
+
+void gl3wShutdown(GL3WContext *context) {
+    libgl_close();
+    memset(context, 0, sizeof(*context));
+}
+
+int gl3wIsSupported(const GL3WContext *context, int major, int minor) {
+    if (context->major < 3)
+        return 0;
+
+    if (context->major == major)
+        return context->minor >= minor;
+    else
+        return context->major >= major;
+}
+
+GL3WglProc gl3wGetProcAddress(const char *proc) {
+    return libgl_sym(proc);
+}
+''')
